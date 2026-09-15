@@ -19,7 +19,7 @@ on:
       script_path:
         description: "Ruta al guion dentro del repo"
         required: true
-        default: "scripts/episode-01.md"
+        default: "gp-video-factory/scripts/episode-01.md"
       title:
         description: "Título del video (para la miniatura)"
         required: true
@@ -46,7 +46,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
 
       - name: Instalar dependencias de Python
-        run: pip install -r automation/requirements.txt
+        run: pip install -r gp-video-factory/automation/requirements.txt
 
       - name: Descargar el modelo de voz Piper (una vez por ejecución)
         run: |
@@ -64,7 +64,7 @@ jobs:
         env:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: |
-          python3 automation/make_video.py \
+          python3 gp-video-factory/automation/make_video.py \
             --script "${{ inputs.script_path }}" \
             --voice-model "voices/${{ inputs.voice }}.onnx" \
             --pexels-key "$PEXELS_API_KEY" \
@@ -72,7 +72,7 @@ jobs:
 
       - name: Preparar la descripción de YouTube junto con el video
         run: |
-          cp video1-descripcion-youtube.md output/ 2>/dev/null || true
+          cp gp-video-factory/video1-descripcion-youtube.md output/ 2>/dev/null || true
 
       - name: Subir el resultado (lo bajás desde acá)
         uses: actions/upload-artifact@v4
