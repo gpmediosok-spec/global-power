@@ -1,0 +1,82 @@
+name: make-video
+
+# CÓMO USAR (todo por navegador, sin instalar nada en tu PC):
+#   1. Andá a la pestaña "Actions" de este repositorio en github.com
+#   2. Elegí "make-video" en la lista de la izquierda
+#   3. Clic en el botón "Run workflow" (arriba a la derecha)
+#   4. (Opcional) Cambiá el título o la ruta del guion si querés
+#   5. Clic en el botón verde "Run workflow"
+#   6. Esperá unos 5-15 minutos (se actualiza solo, podés cerrar la pestaña)
+#   7. Cuando termine (tilde verde), entrá a esa ejecución y bajá el
+#      archivo "video-listo" en la sección "Artifacts", al final de la página
+#
+# Esto corre en una computadora que te presta GitHub gratis (no la tuya),
+# hace todo el trabajo, y te deja el resultado listo para bajar.
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_path:
+        description: "Ruta al guion dentro del repo"
+        required: true
+        default: "scripts/episode-01.md"
+      title:
+        description: "Título del video (para la miniatura)"
+        required: true
+        default: "America Built a Weapon That Hit 20,000 Chinese Companies"
+      voice:
+        description: "Voz de Piper a usar"
+        required: false
+        default: "en_US-ljspeech-high"
+
+jobs:
+  build-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Descargar el código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar ffmpeg y fuentes
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Instalar dependencias de Python
+        run: pip install -r automation/requirements.txt
+
+      - name: Descargar el modelo de voz Piper (una vez por ejecución)
+        run: |
+          mkdir -p voices
+          VOICE="${{ inputs.voice }}"
+          LANG_PART=$(echo "$VOICE" | cut -d'_' -f1)
+          REGION_PART=$(echo "$VOICE" | cut -d'-' -f1)
+          NAME_PART=$(echo "$VOICE" | cut -d'-' -f2)
+          QUALITY_PART=$(echo "$VOICE" | cut -d'-' -f3)
+          BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/${LANG_PART}/${REGION_PART}/${NAME_PART}/${QUALITY_PART}"
+          wget -q -O "voices/${VOICE}.onnx" "${BASE_URL}/${VOICE}.onnx"
+          wget -q -O "voices/${VOICE}.onnx.json" "${BASE_URL}/${VOICE}.onnx.json"
+
+      - name: Generar el video completo (voz + visuales + edición + subtítulos + miniatura + Short)
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: |
+          python3 automation/make_video.py \
+            --script "${{ inputs.script_path }}" \
+            --voice-model "voices/${{ inputs.voice }}.onnx" \
+            --pexels-key "$PEXELS_API_KEY" \
+            --title "${{ inputs.title }}"
+
+      - name: Preparar la descripción de YouTube junto con el video
+        run: |
+          cp video1-descripcion-youtube.md output/ 2>/dev/null || true
+
+      - name: Subir el resultado (lo bajás desde acá)
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-listo
+          path: output/
+          retention-days: 14
