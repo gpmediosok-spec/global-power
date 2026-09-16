@@ -1,46 +1,50 @@
 #!/usr/bin/env python3
 """
-GLOBAL POWER — make_video.py
+GLOBAL POWER — make_video.py (v2 — post-Video-1 hardening pass)
 
 Automates steps 2, 3, and 4 of producing a video from an already-written
-script (step 1, writing the script, is done — see global-power-ep1-script.md).
+script.
 
-WHAT THIS SCRIPT DOES, END TO END:
-  1. Parses the script markdown into scenes (one per "## " section).
-  2. Calls your LOCAL Piper install to synthesize narration audio per scene.
-  3. Searches Pexels for a matching stock video clip per scene (step 2:
-     visuals, automated).
-  4. Assembles each scene (clip + narration) and concatenates them into
-     one final video with ffmpeg (step 3: editing, automated).
-  5. Runs Whisper locally to generate subtitles and burns them in.
-  6. Generates 3 thumbnail variants with title text overlaid (step 4:
-     thumbnail, automated).
+CHANGES IN THIS VERSION (fixing issues found in the first real render):
+  1. Duration safety net: the final video is now HARD-TRIMMED to the total
+     narration duration (plus a tiny deliberate tail) as the very last
+     step, regardless of anything upstream. Video can no longer run long.
+  2. Multi-shot B-roll: each scene is now built from several short clips
+     (~12s each, documentary pace) instead of one clip stretched/looped
+     for the whole scene.
+  3. Smarter Pexels selection: no longer just picks the longest available
+     clip. Scores by search relevance (Pexels' own ranking) + duration
+     fit + avoids clips already used earlier in the same video.
+  4. -stream_loop -1 is now CONDITIONAL: only applied when the clip is
+     actually shorter than the shot it needs to fill. A long clip is just
+     trimmed, never redundantly looped.
+  5. Audio true-peak ceiling: the finished final_video.mp4 itself (not
+     just an intermediate WAV) is passed through a peak limiter as the
+     last processing step, targeting well under 0 dBTP.
+  6. Normalized frame rate (30fps) on every shot, to avoid concat issues
+     between clips of different source frame rates.
 
-WHAT YOU STILL DO MANUALLY (step 1, per your request):
-  - Install Piper locally: https://github.com/OHF-Voice/piper1-gpl
-    (`pip install piper-tts==1.4.2`) and download the voice model once:
-    https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/ljspeech/high
-  - Get a free Pexels API key: https://www.pexels.com/api/ (used for visuals)
-  - Upload the final MP4 to YouTube yourself (Phase 3 will automate this
-    part too, once the pipeline is proven).
+WHAT YOU STILL DO MANUALLY:
+  - Install Piper locally / this runs inside GitHub Actions with Piper
+    installed via pip (see the workflow file).
+  - Get a free Pexels API key.
+  - Upload the final MP4 to YouTube yourself.
 
-REQUIREMENTS (install once):
+REQUIREMENTS:
     pip install piper-tts==1.4.2 faster-whisper==1.1.0 requests==2.32.3 pillow==11.0.0
-    ffmpeg must be installed and on PATH (ffmpeg.org/download.html)
+    ffmpeg must be installed and on PATH.
 
 USAGE:
-    python3 make_video.py --script global-power-ep1-script.md \
+    python3 make_video.py --script episode-01.md \
                            --voice-model /path/to/en_US-ljspeech-high.onnx \
                            --pexels-key YOUR_PEXELS_KEY \
                            --title "America Built a Weapon That Hit 20,000 Chinese Companies"
-
-Output lands in ./output/: final_video.mp4, subtitles.srt, thumbnail_1.png,
-thumbnail_2.png, thumbnail_3.png.
 """
 
 import argparse
-import json
+import random
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,26 +53,35 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 # ==========================================================================
-# CONFIG DEFAULTS — override via CLI flags, see argparse section below
+# CONFIG DEFAULTS
 # ==========================================================================
 
 WORKDIR = Path("./work")
 OUTDIR = Path("./output")
 VIDEO_WIDTH, VIDEO_HEIGHT = 1920, 1080
+VIDEO_FPS = 30
 WHISPER_MODEL_SIZE = "base"
 
-# Manual keyword hints per scene heading, used to search Pexels. Falls back
-# to a generic geopolitics/tech query if a heading isn't in this map.
-SCENE_KEYWORDS = {
-    "COLD OPEN": "government building silhouette dramatic",
-    "PART 1": "computer chip factory technology",
-    "PART 2": "network connections data map",
-    "PART 3": "industrial factory gas pipes",
-    "PART 4": "handshake diplomats meeting",
-    "PART 5": "clock ticking countdown",
-    "CLOSE": "world map global trade",
+SHOT_TARGET_SECONDS = 12      # aim for a new shot roughly every ~12s (documentary pace)
+MAX_SHOTS_PER_SCENE = 6
+MIN_SHOT_SECONDS = 4          # never split below this, avoids frantic cutting
+FINAL_TAIL_PADDING = 0.3      # tiny deliberate margin after the last word, not a full clip
+AUDIO_PEAK_LIMIT = 0.83       # linear ceiling ≈ -1.6 dBTP
+
+# Several sub-topic queries per scene, cycled across that scene's shots, so
+# a long scene pulls from more than one visual idea instead of one clip
+# stretched to fill it. The globe/map resource is deliberately tied to the
+# "ownership network" concepts (Part 2) rather than used as generic filler.
+SCENE_QUERIES = {
+    "COLD OPEN": ["us capitol washington dramatic", "washington dc government building night"],
+    "PART 1": ["semiconductor manufacturing factory", "computer chips close up technology", "china factory manufacturing workers"],
+    "PART 2": ["global network map connections", "world map data nodes glowing", "corporate ownership structure diagram"],
+    "PART 3": ["tungsten mining industrial", "chemical manufacturing plant", "industrial production factory china"],
+    "PART 4": ["diplomats handshake meeting", "trade negotiation summit table", "international summit flags"],
+    "PART 5": ["clock countdown ticking macro", "cargo containers shipping port", "customs trade port cranes"],
+    "CLOSE": ["world map global trade routes", "financial markets stock exchange global"],
 }
-DEFAULT_KEYWORD = "geopolitics global economy abstract"
+DEFAULT_QUERIES = ["geopolitics global economy abstract"]
 
 
 # ==========================================================================
@@ -76,8 +89,6 @@ DEFAULT_KEYWORD = "geopolitics global economy abstract"
 # ==========================================================================
 
 def parse_scenes(script_path: Path):
-    """Split the markdown script into (heading, narration_text) scenes.
-    Skips the front-matter, SOURCES, and NOTES sections."""
     text = script_path.read_text(encoding="utf-8")
     skip_prefixes = ("SOURCES", "NOTES FOR THE FACT-CHECK")
 
@@ -106,15 +117,15 @@ def parse_scenes(script_path: Path):
     return scenes
 
 
-def scene_keyword(heading: str) -> str:
-    for key, kw in SCENE_KEYWORDS.items():
+def scene_queries(heading: str):
+    for key, queries in SCENE_QUERIES.items():
         if heading.upper().startswith(key):
-            return kw
-    return DEFAULT_KEYWORD
+            return queries
+    return DEFAULT_QUERIES
 
 
 # ==========================================================================
-# STEP 1 (assumed done by the user) — just a helper to call local Piper
+# STEP 1 — local Piper call
 # ==========================================================================
 
 def synthesize_audio(text: str, voice_model: Path, out_wav: Path):
@@ -128,7 +139,7 @@ def synthesize_audio(text: str, voice_model: Path, out_wav: Path):
         raise RuntimeError(f"piper failed: {proc.stderr.decode(errors='ignore')}")
 
 
-def get_audio_duration(path: Path) -> float:
+def get_duration(path: Path) -> float:
     proc = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
@@ -138,28 +149,65 @@ def get_audio_duration(path: Path) -> float:
 
 
 # ==========================================================================
-# STEP 2 (automated) — fetch a matching stock video clip from Pexels
+# STEP 2 — fetch B-roll from Pexels with a relevance/variety-aware heuristic
 # ==========================================================================
 
-def fetch_pexels_clip(keyword: str, pexels_key: str, out_path: Path, min_duration: float):
-    print(f"  [visuals] searching Pexels for: '{keyword}'")
+def search_pexels(query: str, pexels_key: str, per_page: int = 8):
     resp = requests.get(
         "https://api.pexels.com/videos/search",
         headers={"Authorization": pexels_key},
-        params={"query": keyword, "per_page": 5, "orientation": "landscape"},
+        params={"query": query, "per_page": per_page, "orientation": "landscape"},
         timeout=30,
     )
     resp.raise_for_status()
-    results = resp.json().get("videos", [])
+    return resp.json().get("videos", [])
+
+
+def pick_best_clip(results, shot_duration: float, used_ids: set):
+    """Heuristic selection (no AI needed):
+    1. Respect Pexels' own relevance ranking as the primary signal (the
+       order results come back in).
+    2. Penalize clips whose duration is a poor fit (too short = lots of
+       looping; wildly longer than needed = usually generic filler).
+    3. Prefer clips not already used earlier in this video, but don't
+       fail the whole scene if every candidate has been used before.
+    """
     if not results:
-        raise RuntimeError(f"No Pexels results for '{keyword}'")
+        return None
 
-    # Prefer a clip at least as long as the narration; otherwise take the
-    # longest available (we'll loop it with ffmpeg if still too short).
-    results.sort(key=lambda v: v.get("duration", 0), reverse=True)
-    chosen = results[0]
+    def score(rank, video):
+        dur = video.get("duration", 0) or 0
+        if dur <= 0:
+            duration_penalty = 50
+        elif dur < shot_duration:
+            duration_penalty = (shot_duration - dur) * 2  # will need looping
+        elif dur > shot_duration * 6:
+            duration_penalty = 15  # probably generic ambient filler, mild penalty
+        else:
+            duration_penalty = 0
+        reuse_penalty = 100 if video["id"] in used_ids else 0
+        return rank * 3 + duration_penalty + reuse_penalty
 
-    # Pick the highest-resolution landscape file link available.
+    ranked = sorted(enumerate(results), key=lambda pair: score(pair[0], pair[1]))
+    return ranked[0][1]
+
+
+def fetch_pexels_shot(queries, shot_index: int, shot_duration: float,
+                       pexels_key: str, out_path: Path, used_ids: set):
+    query = queries[shot_index % len(queries)]
+    print(f"  [visuals] shot {shot_index + 1}: searching Pexels for '{query}'")
+    results = search_pexels(query, pexels_key)
+
+    if not results:
+        # Fall back to the generic default query rather than crashing the run.
+        print(f"    no results for '{query}', falling back to default query")
+        results = search_pexels(DEFAULT_QUERIES[0], pexels_key)
+    if not results:
+        raise RuntimeError(f"No Pexels results at all for '{query}' or the fallback query")
+
+    chosen = pick_best_clip(results, shot_duration, used_ids)
+    used_ids.add(chosen["id"])
+
     files = sorted(
         chosen["video_files"],
         key=lambda f: (f.get("width") or 0) * (f.get("height") or 0),
@@ -173,24 +221,94 @@ def fetch_pexels_clip(keyword: str, pexels_key: str, out_path: Path, min_duratio
         for chunk in r.iter_content(chunk_size=1 << 16):
             f.write(chunk)
 
+    return chosen.get("duration", 0)
+
 
 # ==========================================================================
-# STEP 3 (automated) — assemble each scene, then concatenate with ffmpeg
+# STEP 3a — build one silent, exact-duration, normalized "shot"
 # ==========================================================================
 
-def build_scene_clip(raw_clip: Path, audio_wav: Path, out_mp4: Path, duration: float):
-    print(f"  [assemble] building scene -> {out_mp4.name} ({duration:.1f}s)")
-    # -stream_loop -1 lets ffmpeg loop the source clip if it's shorter than
-    # the narration; -shortest then trims everything to the audio length.
+def build_silent_shot(raw_clip: Path, source_duration: float, shot_duration: float, out_mp4: Path):
+    """Scales/crops to the standard frame, normalizes to VIDEO_FPS, and
+    trims to EXACTLY shot_duration. Only loops if the source clip is
+    actually shorter than what's needed — a long clip is just trimmed,
+    never redundantly looped."""
+    needs_loop = source_duration > 0 and source_duration < shot_duration
+    cmd = ["ffmpeg", "-y"]
+    if needs_loop:
+        cmd += ["-stream_loop", "-1"]
+    cmd += [
+        "-i", str(raw_clip),
+        "-an",
+        "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
+               f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps={VIDEO_FPS}",
+        "-t", f"{shot_duration:.3f}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(out_mp4),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def split_duration(total: float, n: int):
+    """n shot durations that sum EXACTLY to total (last one absorbs rounding)."""
+    base = total / n
+    durs = [base] * n
+    durs[-1] = total - sum(durs[:-1])
+    return durs
+
+
+def assemble_scene_broll(heading: str, duration: float, pexels_key: str,
+                          work_prefix: Path, used_ids: set) -> Path:
+    """Builds the scene's full-duration SILENT video track out of several
+    shots pulled from different queries, so no single clip fills more
+    than ~SHOT_TARGET_SECONDS of screen time."""
+    queries = scene_queries(heading)
+
+    n_shots = max(1, min(MAX_SHOTS_PER_SCENE, round(duration / SHOT_TARGET_SECONDS)))
+    if duration / max(n_shots, 1) < MIN_SHOT_SECONDS and n_shots > 1:
+        n_shots = max(1, int(duration // MIN_SHOT_SECONDS))
+    shot_durations = split_duration(duration, n_shots)
+
+    print(f"  [broll] {heading}: {n_shots} shot(s) totaling {duration:.1f}s "
+          f"({', '.join(f'{d:.1f}s' for d in shot_durations)})")
+
+    shot_files = []
+    for i, shot_dur in enumerate(shot_durations):
+        raw = work_prefix.with_name(work_prefix.name + f"_shot{i:02}_raw.mp4")
+        shot_out = work_prefix.with_name(work_prefix.name + f"_shot{i:02}.mp4")
+        source_dur = fetch_pexels_shot(queries, i, shot_dur, pexels_key, raw, used_ids)
+        build_silent_shot(raw, source_dur, shot_dur, shot_out)
+        shot_files.append(shot_out)
+
+    broll_out = work_prefix.with_name(work_prefix.name + "_broll.mp4")
+    if len(shot_files) == 1:
+        shot_files[0].rename(broll_out)
+    else:
+        concat_list = work_prefix.with_name(work_prefix.name + "_concat.txt")
+        with open(concat_list, "w") as f:
+            for sf in shot_files:
+                f.write(f"file '{sf.resolve()}'\n")
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list), "-c", "copy", str(broll_out),
+        ], check=True, capture_output=True)
+
+    return broll_out
+
+
+# ==========================================================================
+# STEP 3b — mux a scene's silent B-roll with its narration audio
+# ==========================================================================
+
+def mux_scene(broll_silent: Path, audio_wav: Path, out_mp4: Path, duration: float):
+    print(f"  [assemble] muxing scene -> {out_mp4.name} ({duration:.1f}s)")
     subprocess.run([
         "ffmpeg", "-y",
-        "-stream_loop", "-1", "-i", str(raw_clip),
+        "-i", str(broll_silent),
         "-i", str(audio_wav),
-        "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
-               f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT}",
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-c:a", "aac",
-        "-t", str(duration),
+        "-c:v", "copy", "-c:a", "aac",
+        "-t", f"{duration:.3f}",
         "-shortest",
         str(out_mp4),
     ], check=True, capture_output=True)
@@ -204,14 +322,12 @@ def concatenate_scenes(scene_files, out_path: Path):
             f.write(f"file '{sf.resolve()}'\n")
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
-        str(out_path),
+        "-i", str(concat_list), "-c", "copy", str(out_path),
     ], check=True, capture_output=True)
 
 
 # ==========================================================================
-# STEP 3b (automated) — subtitles via local Whisper, burned into the video
+# STEP 3c — subtitles via local Whisper, burned into the video
 # ==========================================================================
 
 def generate_subtitles(video_path: Path, srt_path: Path):
@@ -242,7 +358,32 @@ def burn_subtitles(video_in: Path, srt_path: Path, video_out: Path):
 
 
 # ==========================================================================
-# STEP 4 (automated) — thumbnail generation with Pillow
+# STEP 3d (NEW) — final mastering pass: HARD duration cap + audio peak ceiling
+# ==========================================================================
+
+def final_master(video_in: Path, target_duration: float, video_out: Path):
+    """The last word on both open problems from Video 1:
+    - Duration: no matter what happened upstream, the file on disk after
+      this step can never exceed target_duration (+ the tiny deliberate
+      tail padding already folded into target_duration by the caller).
+    - Audio: runs the actual output audio through a peak limiter so the
+      finished final_video.mp4 itself — not just an intermediate WAV —
+      stays under the true-peak ceiling.
+    Video is stream-copied (fast, no quality loss); only audio is
+    re-encoded, since only audio needs the limiter applied.
+    """
+    print(f"  [master] final hard-trim to {target_duration:.2f}s + peak limiter -> {video_out.name}")
+    subprocess.run([
+        "ffmpeg", "-y", "-i", str(video_in),
+        "-t", f"{target_duration:.3f}",
+        "-af", f"alimiter=limit={AUDIO_PEAK_LIMIT}:attack=5:release=50:level=disabled",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        str(video_out),
+    ], check=True, capture_output=True)
+
+
+# ==========================================================================
+# STEP 4 — thumbnails
 # ==========================================================================
 
 def extract_frame(video_path: Path, timestamp: float, out_png: Path):
@@ -262,13 +403,11 @@ def make_thumbnail(frame_png: Path, title: str, out_png: Path, style: str):
     except OSError:
         font = ImageFont.load_default()
 
-    # Darken a band behind the text for legibility.
     band_top = 720 - 260 if style in ("bottom", "highcontrast") else 40
     band = Image.new("RGBA", (1280, 260), (0, 0, 0, 160))
     img.paste(Image.alpha_composite(img.crop((0, band_top, 1280, band_top + 260)).convert("RGBA"), band).convert("RGB"),
               (0, band_top))
 
-    # Wrap title text manually into up to 3 lines.
     words = title.upper().split()
     lines, current = [], ""
     for w in words:
@@ -300,21 +439,17 @@ def make_thumbnail(frame_png: Path, title: str, out_png: Path, style: str):
 # OPTIMIZATION — automatic Short (vertical, ~30-45s) from the Cold Open scene
 # ==========================================================================
 
-def build_short(raw_clip: Path, audio_wav: Path, channel_name: str, out_mp4: Path):
-    """Turns the Cold Open scene into a vertical Short with big burned
-    captions and a call-to-action at the end. Shorts are the top-of-funnel
-    for discovery, so this reuses the strongest hook (the cold open) rather
-    than a random scene."""
+def build_short(broll_silent: Path, audio_wav: Path, channel_name: str, out_mp4: Path):
     print("  [short] generating vertical Short from the Cold Open scene...")
 
-    duration = get_audio_duration(audio_wav)
+    duration = get_duration(audio_wav)
     short_srt = WORKDIR / "short_subtitles.srt"
     generate_subtitles(audio_wav, short_srt)
 
     cta_start = max(duration - 2.5, 0)
     subprocess.run([
         "ffmpeg", "-y",
-        "-stream_loop", "-1", "-i", str(raw_clip),
+        "-i", str(broll_silent),
         "-i", str(audio_wav),
         "-vf",
         f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
@@ -325,7 +460,8 @@ def build_short(raw_clip: Path, audio_wav: Path, channel_name: str, out_mp4: Pat
         f"enable='gte(t,{cta_start})'",
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "libx264", "-c:a", "aac",
-        "-t", str(duration),
+        "-af", f"alimiter=limit={AUDIO_PEAK_LIMIT}:attack=5:release=50:level=disabled",
+        "-t", f"{duration:.3f}",
         "-shortest",
         str(out_mp4),
     ], check=True, capture_output=True)
@@ -337,31 +473,22 @@ def build_short(raw_clip: Path, audio_wav: Path, channel_name: str, out_mp4: Pat
 
 def main():
     ap = argparse.ArgumentParser(description="Automate GLOBAL POWER video assembly (steps 2-4)")
-    ap.add_argument("--script", required=True, type=Path, help="Path to the script markdown file")
-    ap.add_argument("--voice-model", required=True, type=Path, help="Path to the Piper .onnx voice model")
-    ap.add_argument("--pexels-key", required=True, help="Free Pexels API key")
-    ap.add_argument("--title", required=True, help="Video title, used for the thumbnail")
-    ap.add_argument("--channel-name", default="GLOBAL POWER", help="Shown in the Short's call-to-action overlay")
-    ap.add_argument("--skip-subtitles", action="store_true", help="Skip Whisper subtitle burn-in (faster)")
-    ap.add_argument("--skip-short", action="store_true", help="Skip generating the vertical Short")
+    ap.add_argument("--script", required=True, type=Path)
+    ap.add_argument("--voice-model", required=True, type=Path)
+    ap.add_argument("--pexels-key", required=True)
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--channel-name", default="GLOBAL POWER")
+    ap.add_argument("--skip-subtitles", action="store_true")
+    ap.add_argument("--skip-short", action="store_true")
     args = ap.parse_args()
 
-    import shutil
     missing = [t for t in ("piper", "ffmpeg", "ffprobe") if shutil.which(t) is None]
     if missing:
-        print(f"\nERROR: no se encontraron estos programas en el PATH: {missing}\n"
-              f"Si esto corre en GitHub Actions, revisá que los pasos de instalación\n"
-              f"previos (pip install / apt-get install) hayan terminado sin error.\n",
-              file=sys.stderr)
+        print(f"\nERROR: no se encontraron estos programas en el PATH: {missing}\n", file=sys.stderr)
         sys.exit(1)
 
     if not args.pexels_key or not args.pexels_key.strip():
-        print(
-            "\nERROR: no llegó una API key de Pexels válida.\n"
-            "Revisá que en GitHub, en Settings -> Secrets and variables -> Actions,\n"
-            "exista un secret llamado exactamente PEXELS_API_KEY con tu key pegada ahí.\n",
-            file=sys.stderr,
-        )
+        print("\nERROR: no llegó una API key de Pexels válida (PEXELS_API_KEY).\n", file=sys.stderr)
         sys.exit(1)
 
     WORKDIR.mkdir(exist_ok=True)
@@ -371,58 +498,69 @@ def main():
     scenes = parse_scenes(args.script)
     print(f"Found {len(scenes)} scenes.")
 
+    used_clip_ids = set()
     scene_mp4s = []
+    total_narration_duration = 0.0
+    scene1_broll = scene1_audio = None
+
     for i, (heading, body) in enumerate(scenes, start=1):
         print(f"\nScene {i}/{len(scenes)}: {heading}")
         audio_wav = WORKDIR / f"scene_{i:02}_audio.wav"
-        raw_clip = WORKDIR / f"scene_{i:02}_raw.mp4"
         scene_mp4 = WORKDIR / f"scene_{i:02}_final.mp4"
 
         synthesize_audio(body, args.voice_model, audio_wav)
-        duration = get_audio_duration(audio_wav)
+        duration = get_duration(audio_wav)
+        total_narration_duration += duration
 
-        keyword = scene_keyword(heading)
-        fetch_pexels_clip(keyword, args.pexels_key, raw_clip, duration)
-        build_scene_clip(raw_clip, audio_wav, scene_mp4, duration)
+        broll = assemble_scene_broll(heading, duration, args.pexels_key,
+                                      WORKDIR / f"scene_{i:02}", used_clip_ids)
+        mux_scene(broll, audio_wav, scene_mp4, duration)
 
         scene_mp4s.append(scene_mp4)
         if i == 1:
-            # Keep the Cold Open's raw clip/audio around for the Short.
-            scene1_raw_clip, scene1_audio = raw_clip, audio_wav
+            scene1_broll, scene1_audio = broll, audio_wav
 
     if not args.skip_short:
         print("\nGenerating vertical Short from the Cold Open...")
         short_out = OUTDIR / "short_video.mp4"
-        build_short(scene1_raw_clip, scene1_audio, args.channel_name, short_out)
+        build_short(scene1_broll, scene1_audio, args.channel_name, short_out)
         print(f"  -> {short_out}")
 
     raw_final = WORKDIR / "final_no_subs.mp4"
     concatenate_scenes(scene_mp4s, raw_final)
 
-    final_video = OUTDIR / "final_video.mp4"
+    subtitled = WORKDIR / "final_subtitled.mp4"
     srt_path = OUTDIR / "subtitles.srt"
-
     if args.skip_subtitles:
-        raw_final.rename(final_video)
+        subtitled = raw_final
     else:
         generate_subtitles(raw_final, srt_path)
-        burn_subtitles(raw_final, srt_path, final_video)
+        burn_subtitles(raw_final, srt_path, subtitled)
+
+    # SAFETY NET (layer 3): hard-trim to the real total narration duration
+    # plus a tiny deliberate tail, and apply the audio peak ceiling to the
+    # ACTUAL finished file — regardless of anything upstream.
+    final_video = OUTDIR / "final_video.mp4"
+    target_duration = total_narration_duration + FINAL_TAIL_PADDING
+    final_master(subtitled, target_duration, final_video)
 
     print("\nGenerating thumbnails...")
     frame_png = WORKDIR / "thumb_frame.png"
-    # Grab from the PRE-subtitle video so a caption line never accidentally
-    # lands baked into the thumbnail image. If subtitles were skipped,
-    # raw_final was already renamed into final_video, so fall back to that.
-    approx_ts = get_audio_duration(WORKDIR / "scene_01_audio.wav") + 2
-    frame_source = raw_final if raw_final.exists() else final_video
-    extract_frame(frame_source, approx_ts, frame_png)
+    approx_ts = get_duration(WORKDIR / "scene_01_audio.wav") + 2
+    extract_frame(raw_final, approx_ts, frame_png)
 
     for i, style in enumerate(["bottom", "top", "alert", "highcontrast"], start=1):
         out_png = OUTDIR / f"thumbnail_{i}.png"
         make_thumbnail(frame_png, args.title, out_png, style)
         print(f"  -> {out_png}")
 
-    print(f"\nDone. Final video: {final_video}")
+    actual_final_duration = get_duration(final_video)
+    print(f"\nDone.")
+    print(f"Narration total: {total_narration_duration:.2f}s")
+    print(f"Final video duration: {actual_final_duration:.2f}s")
+    print(f"Difference: {actual_final_duration - total_narration_duration:.2f}s")
+    print(f"Unique Pexels clips used: {len(used_clip_ids)}")
+    print(f"Final video: {final_video}")
     print(f"Short: {OUTDIR / 'short_video.mp4' if not args.skip_short else '(skipped)'}")
     print(f"Subtitles: {srt_path if not args.skip_subtitles else '(skipped)'}")
     print(f"Thumbnails: {OUTDIR}/thumbnail_1.png through thumbnail_4.png")
