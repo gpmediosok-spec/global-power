@@ -66,7 +66,19 @@ SHOT_TARGET_SECONDS = 12      # aim for a new shot roughly every ~12s (documenta
 MAX_SHOTS_PER_SCENE = 6
 MIN_SHOT_SECONDS = 4          # never split below this, avoids frantic cutting
 FINAL_TAIL_PADDING = 0.3      # tiny deliberate margin after the last word, not a full clip
-AUDIO_PEAK_LIMIT = 0.83       # linear ceiling ≈ -1.6 dBTP
+AUDIO_PEAK_LIMIT = 0.75       # calibrated from real render #2 measurement:
+                               # limit=0.83 (nominal -1.62 dBFS) produced an
+                               # ACTUAL measured true peak of -0.6 dBTP, i.e.
+                               # ~1.02 dB of inter-sample overshoot (alimiter
+                               # limits sample peaks, not oversampled true
+                               # peaks, so some overshoot is expected). This
+                               # value (-2.52 dB nominal / 0.75 linear) is
+                               # calibrated to land the ACTUAL true peak of
+                               # the finished file at approximately -1.5 dBTP.
+                               # If a future real render measures meaningfully
+                               # off target, adjust this constant by the same
+                               # residual difference (in dB, converted back to
+                               # linear via 10**(db/20)) rather than guessing.
 
 # Several sub-topic queries per scene, cycled across that scene's shots, so
 # a long scene pulls from more than one visual idea instead of one clip
