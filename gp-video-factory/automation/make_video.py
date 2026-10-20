@@ -100,9 +100,19 @@ DEFAULT_QUERIES = ["geopolitics global economy abstract"]
 # STEP 0 — parse the script into scenes
 # ==========================================================================
 
+# Per-scene B-roll queries declared inside the script itself, as a line like
+#   <!-- broll: power transformer factory | high voltage substation -->
+# right under a "## HEADING". Filled by parse_scenes, read by scene_queries.
+# The comment line is removed from the narration. Scripts without such lines
+# keep using SCENE_QUERIES exactly as before.
+SCRIPT_QUERIES = {}
+BROLL_RE = re.compile(r"^\s*<!--\s*broll:\s*(.+?)\s*-->\s*$", re.IGNORECASE)
+
+
 def parse_scenes(script_path: Path):
     text = script_path.read_text(encoding="utf-8")
     skip_prefixes = ("SOURCES", "NOTES FOR THE FACT-CHECK")
+    SCRIPT_QUERIES.clear()
 
     scenes = []
     current_heading = None
@@ -119,6 +129,12 @@ def parse_scenes(script_path: Path):
             current_lines = []
             continue
         if current_heading is not None:
+            bm = BROLL_RE.match(line)
+            if bm:
+                qs = [q.strip() for q in bm.group(1).split("|") if q.strip()]
+                if qs:
+                    SCRIPT_QUERIES[current_heading] = qs
+                continue
             current_lines.append(line)
 
     if current_heading and not current_heading.upper().startswith(skip_prefixes):
@@ -130,6 +146,8 @@ def parse_scenes(script_path: Path):
 
 
 def scene_queries(heading: str):
+    if heading in SCRIPT_QUERIES:
+        return SCRIPT_QUERIES[heading]
     for key, queries in SCENE_QUERIES.items():
         if heading.upper().startswith(key):
             return queries
